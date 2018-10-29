@@ -7,7 +7,7 @@ import os
 from nipype import config
 config.enable_provenance()
 
-from nipype import Workflow, Node, MapNode, Function
+from nipype import Workflow, Node, MapNode, Function, IdentityInterface
 from nipype.interfaces.fsl import BET, FAST, FIRST, Reorient2Std, ImageMaths, ImageStats
 from nipype.interfaces.io import DataSink
 
@@ -80,16 +80,22 @@ def toJSON(stats, seg_file, structure_map):
     return os.path.abspath(out_file)
 
 
-def create_workflow(subject_id, outdir, file_url):
+def create_workflow(subject_id, outdir, infile=None, file_url=None):
     """Create a workflow for a single participant"""
 
     sink_directory = os.path.join(outdir, subject_id)
-    
+
     wf = Workflow(name=subject_id)
 
-    getter = Node(Function(input_names=['url'], output_names=['localfile'],
-                           function=download_file), name="download_url")
-    getter.inputs.url = file_url
+    if file_url:
+        getter = Node(Function(input_names=['url'], output_names=['localfile'],
+                               function=download_file), name="download_url")
+        getter.inputs.url = file_url
+    elif infile:
+        getter = Node(IdentityInterface(fields='localfile'), name='infosource')
+        getter.inputs.localfile = infile
+    else:
+        raise RuntimeError("Both infile and file_url are not specified")
 
     orienter = Node(Reorient2Std(), name='reorient_brain')
     wf.connect(getter, 'localfile', orienter, 'in_file')
@@ -115,7 +121,7 @@ def create_workflow(subject_id, outdir, file_url):
     fslstatser.inputs.op_string = ['-l {thr1} -u {thr2} -v'.format(thr1=val + 0.5, thr2=val + 1.5) for val in range(3)]
     wf.connect(faster, 'partial_volume_map', fslstatser, 'in_file')
 
-    jsonfiler = Node(Function(input_names=['stats', 'seg_file', 'structure_map', 'struct_file'], 
+    jsonfiler = Node(Function(input_names=['stats', 'seg_file', 'structure_map', 'struct_file'],
                               output_names=['out_file'],
                               function=toJSON), name='save_json')
     structure_map = [('Background', 0),
@@ -160,8 +166,13 @@ if  __name__ == '__main__':
     defstr = ' (default %(default)s)'
     parser = ArgumentParser(description=__doc__,
                             formatter_class=RawTextHelpFormatter)
-    parser.add_argument("--key", dest="key",
+    inputs = parser.add_mutually_exclusive_group()
+    inputs.add_argument("--key", dest="key",
                         help="google docs key")
+    inputs.add_argument("-i", "--infile",
+                        help="input file")
+    parser.add_argument("-s", "--subjid",
+                        help="subject id (required if using --infile)")
     parser.add_argument("-o", "--output_dir", dest="sink_dir", default='output',
                         help="Sink directory base")
     parser.add_argument("-w", "--work_dir", dest="work_dir",
@@ -182,39 +193,47 @@ if  __name__ == '__main__':
         work_dir = sink_dir
 
     import sys
-    import requests
-    import pandas as pd
 
     #key = '11an55u9t2TAf0EV2pHN0vOd8Ww2Gie-tHp9xGULh_dA'
-    r = requests.get('https://docs.google.com/spreadsheets/d/{key}/export?format=csv&id={key}'.format(key=args.key))
-    if sys.version_info < (3,):
-        from StringIO import StringIO  # got moved to io in python3.
-        data = StringIO(r.content)
-    else:
-        from io import StringIO
-        data = StringIO(r.content.decode())
+    if args.key:
+        import requests
+        import pandas as pd
 
-    df = pd.read_csv(data)
-    max_subjects = df.shape[0]
-    if args.num_subjects:
-        max_subjects = args.num_subjects
-    elif ('CIRCLECI' in os.environ and os.environ['CIRCLECI'] == 'true'):
-        max_subjects = 1
-    
-    meta_wf = Workflow('metaflow')
-    count = 0
-    for row in df.iterrows():
-        wf = create_workflow(row[1].Subject, sink_dir, row[1]['File Path'])
-        meta_wf.add_nodes([wf])
-        print('Added workflow for: {}'.format(row[1].Subject))
-        count = count + 1
-        # run this for only one person on CircleCI
-        if count >= max_subjects:
-            break
+        r = requests.get('https://docs.google.com/spreadsheets/d/{key}/export?format=csv&id={key}'.format(key=args.key))
+        if sys.version_info < (3,):
+            from StringIO import StringIO  # got moved to io in python3.
+            data = StringIO(r.content)
+        else:
+            from io import StringIO
+            data = StringIO(r.content.decode())
+
+            df = pd.read_csv(data)
+            max_subjects = df.shape[0]
+            if args.num_subjects:
+                max_subjects = args.num_subjects
+            elif ('CIRCLECI' in os.environ and os.environ['CIRCLECI'] == 'true'):
+                max_subjects = 1
+
+        meta_wf = Workflow('metaflow')
+        count = 0
+        for row in df.iterrows():
+            wf = create_workflow(row[1].Subject, sink_dir, file_url=row[1]['File Path'])
+            meta_wf.add_nodes([wf])
+            print('Added workflow for: {}'.format(row[1].Subject))
+            count = count + 1
+            # run this for only one person on CircleCI
+            if count >= max_subjects:
+                break
+    elif args.infile:
+        if not args.subjid:
+            raise RuntimeError("Missing --subjid rgument")
+        # run with input file
+        meta_wf = create_workflow(args.subjid, sink_dir, infile=args.infile)
 
     meta_wf.base_dir = work_dir
     meta_wf.config['execution']['remove_unnecessary_files'] = False
     meta_wf.config['execution']['poll_sleep_duration'] = 2
+    meta_wf.config['execution']['crashfile_format'] = 'txt'
     meta_wf.config['execution']['crashdump_dir'] = work_dir
     if args.plugin_args:
         meta_wf.run(args.plugin, plugin_args=eval(args.plugin_args))
