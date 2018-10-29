@@ -92,7 +92,7 @@ def create_workflow(subject_id, outdir, infile=None, file_url=None):
                                function=download_file), name="download_url")
         getter.inputs.url = file_url
     elif infile:
-        getter = Node(IdentityInterface(fields='localfile'), name='infosource')
+        getter = Node(IdentityInterface(fields=['localfile']), name='infosource')
         getter.inputs.localfile = infile
     else:
         raise RuntimeError("Both infile and file_url are not specified")
